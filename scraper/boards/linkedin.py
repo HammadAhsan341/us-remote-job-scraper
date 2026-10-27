@@ -1,0 +1,428 @@
+"""
+LinkedIn job parser using Scrapling's adaptive parsing.
+
+Handles LinkedIn's dynamic content and anti-bot protection.
+"""
+
+from typing import Optional, List, Any, Dict
+from core.state import JobData
+from scraper.boards.linkedin_jd import extract_description_multi
+from scraper.guest import jsonld_job_posting, merge_listing_with_detail, pick_longer_description_job
+from .base import BaseJobParser
+
+
+class _HtmlResponse:
+    """Minimal Scrapling-like wrapper for parsing saved HTML."""
+
+    def __init__(self, html: str, url: str = ""):
+        self.url = url or ""
+        self.body = html or ""
+        self.html_content = self.body
+        self._selector = None
+
+    def css(self, selector: str):
+        if self._selector is None:
+            from scrapling.parser import Selector
+
+            self._selector = Selector(content=self.body, url=self.url)
+        return self._selector.css(selector)
+
+
+class LinkedInParser(BaseJobParser):
+    """LinkedIn job board parser."""
+    
+    board_name = "linkedin"
+    enrich_from_detail_pages = True
+
+    def __init__(self):
+        self._listing_jobs: List[JobData] = []
+        self._default_location = "Pakistan"
+
+    def set_market(self, ctx) -> None:
+        label = getattr(ctx, "location_label", "") if ctx is not None else ""
+        self._default_location = label or "Pakistan"
+
+    def validate_job_data(self, data: dict) -> bool:
+        for field in ["title", "company", "location", "job_url"]:
+            if not data.get(field):
+                print(f"LinkedIn: Missing required field: {field}")
+                return False
+        return True
+    
+    def parse_job(self, response: Any) -> Optional[JobData]:
+        """
+        Parse LinkedIn job posting page.
+        
+        LinkedIn structure:
+        - Title: h1.top-card-layout__title or .job-details-jobs-unified-top-card__job-title
+        - Company: a.topcard__org-name-link or .job-details-jobs-unified-top-card__company-name
+        - Location: span.topcard__flavor--bullet or .job-details-jobs-unified-top-card__bullet
+        - Description: div.description__text or .jobs-description-content__text
+        
+        Args:
+            response: Scrapling Response object
+            
+        Returns:
+            JobData or None
+        """
+        try:
+            # Extract title (adaptive selector)
+            title = self._css_first(response, [
+                "h1.top-card-layout__title",
+                ".job-details-jobs-unified-top-card__job-title",
+                "h1.jobs-unified-top-card__job-title"
+            ])
+            
+            if not title:
+                print(f"LinkedIn: No title found at {response.url}")
+                return None
+            
+            title_text = self.clean_text(self._get_text(title))
+            
+            # Extract company
+            company = self._css_first(response, [
+                "a.topcard__org-name-link",
+                ".job-details-jobs-unified-top-card__company-name a",
+                ".jobs-unified-top-card__company-name a"
+            ])
+            
+            if not company:
+                # Fallback: try without link
+                company = self._css_first(response, [
+                    ".job-details-jobs-unified-top-card__company-name",
+                    ".jobs-unified-top-card__company-name"
+                ])
+            
+            company_text = self.clean_text(self._get_text(company)) if company else "Unknown"
+            
+            # Extract location
+            location = self._css_first(response, [
+                "span.topcard__flavor--bullet",
+                ".job-details-jobs-unified-top-card__bullet",
+                ".jobs-unified-top-card__bullet"
+            ])
+            
+            location_text = self.clean_text(self._get_text(location)) if location else self._default_location
+            
+            html = self._get_html(response)
+            description_text, _src = extract_description_multi(html, response)
+            description_text = self.clean_text(description_text)
+            
+            if not description_text or len(description_text) < 50:
+                print(f"LinkedIn: Description too short at {response.url}")
+                return None
+            
+            # Extract employment type
+            employment_type = None
+            emp_type_elem = self._css_first(response, [
+                ".job-details-jobs-unified-top-card__job-insight span",
+                "li.jobs-unified-top-card__job-insight span"
+            ])
+            
+            if emp_type_elem:
+                emp_text = self._get_text(emp_type_elem).lower()
+                if "full-time" in emp_text or "full time" in emp_text:
+                    employment_type = "full-time"
+                elif "part-time" in emp_text:
+                    employment_type = "part-time"
+                elif "contract" in emp_text:
+                    employment_type = "contract"
+                elif "internship" in emp_text:
+                    employment_type = "internship"
+            
+            # Skills are extracted by the enricher pipeline, not the parser.
+            skills: List[str] = []
+            
+            # Generate job ID
+            job_id = self.generate_job_id(title_text, company_text, location_text)
+            
+            # Build job data
+            job_data: JobData = {
+                "job_id": job_id,
+                "title": title_text,
+                "company": company_text,
+                "location": location_text,
+                "job_url": response.url,
+                "board": self.board_name,
+                "description": description_text,
+                "skills": skills,
+                "posted_date": None,  # LinkedIn often doesn't show exact date
+                "salary": None,  # Rarely shown on LinkedIn Pakistan
+                "employment_type": employment_type,
+                "experience_required": None,  # Could extract from description
+                "raw_html": html
+            }
+            
+            if self.validate_job_data(job_data):
+                return job_data
+            else:
+                return None
+        
+        except Exception as e:
+            print(f"LinkedIn parse error: {e}")
+            return None
+
+    def parse_from_html(
+        self,
+        html: str,
+        job_url: str,
+        listing: Optional[Dict[str, Any]] = None,
+    ) -> Optional[JobData]:
+        """Re-parse stored HTML when the live DOM pick was a short preview."""
+        if not html or not job_url:
+            return None
+        listing = listing or {}
+        page = _HtmlResponse(html, job_url)
+        job = self.parse_job(page)
+        multi, _ = extract_description_multi(html, page)
+        multi = self.clean_text(multi)
+        if job and len(multi) > len((job.get("description") or "")):
+            job = dict(job)
+            job["description"] = multi
+        if job and len((job.get("description") or "")) >= 50:
+            return merge_listing_with_detail(listing, job) if listing else job
+        ld = jsonld_job_posting(html)
+        title_text = (
+            (job or {}).get("title")
+            or listing.get("title")
+            or self.clean_text(ld.get("title") or "")
+        )
+        company_text = (
+            (job or {}).get("company")
+            or listing.get("company")
+            or self.clean_text(ld.get("company") or "")
+            or "Unknown"
+        )
+        location_text = (
+            (job or {}).get("location")
+            or listing.get("location")
+            or self.clean_text(ld.get("location") or "")
+            or self._default_location
+        )
+        description_text = self.clean_text(
+            multi
+            or ((job or {}).get("description") or "")
+            or ld.get("description")
+            or ""
+        )
+        if len(description_text) < 50:
+            return job
+        job_data: JobData = {
+            "job_id": self.generate_job_id(
+                str(title_text), str(company_text), str(location_text)
+            ),
+            "title": str(title_text),
+            "company": str(company_text),
+            "location": str(location_text),
+            "job_url": job_url,
+            "board": self.board_name,
+            "description": description_text,
+            "skills": (job or {}).get("skills") or [],
+            "posted_date": (job or {}).get("posted_date") or listing.get("posted_date"),
+            "salary": (job or {}).get("salary"),
+            "employment_type": (job or {}).get("employment_type"),
+            "experience_required": (job or {}).get("experience_required"),
+            "raw_html": html,
+        }
+        if self.validate_job_data(job_data):
+            return merge_listing_with_detail(listing, job_data) if listing else job_data
+        return job
+
+    def parse_from_response(
+        self,
+        response: Any,
+        listing: Optional[Dict[str, Any]] = None,
+    ) -> Optional[JobData]:
+        """Live parse; always prefer the longest JD source on the page."""
+        listing = listing or {}
+        job_url = getattr(response, "url", None) or listing.get("job_url") or ""
+        html = self._get_html(response)
+        job = self.parse_job(response)
+        fallback = self.parse_from_html(html, job_url, listing)
+        best = pick_longer_description_job(job, fallback)
+        if best and len((best.get("description") or "")) >= 50:
+            return merge_listing_with_detail(listing, best) if listing else best
+        return best or job
+    
+    @staticmethod
+    def guest_job_url(href: str) -> str:
+        """Public job URL on www. Country hosts such as ae.linkedin.com bounce guests home."""
+        if not href or "/jobs/view/" not in href:
+            return ""
+        from urllib.parse import urlparse
+
+        raw = href.split("?")[0]
+        if raw.startswith("http"):
+            path = urlparse(raw).path or ""
+        else:
+            path = raw if raw.startswith("/") else f"/{raw}"
+        if "/jobs/view/" not in path:
+            return ""
+        return f"https://www.linkedin.com{path}"
+
+    def _parse_card(self, card: Any) -> Optional[JobData]:
+        title_el = self._css_first(card, [
+            "h3.base-search-card__title",
+            ".base-search-card__title",
+            "h3.job-search-card__title",
+        ])
+        link = self._css_first(card, [
+            "a.base-card__full-link",
+            "a.job-search-card__link-wrapper",
+            "a[href*='/jobs/view/']",
+        ])
+        href = ""
+        if link is not None and hasattr(link, "attrib"):
+            href = link.attrib.get("href", "")
+        title_text = self.clean_text(self._get_text(title_el) or self._get_text(link))
+        job_url = self.guest_job_url(href)
+        if not title_text or not job_url:
+            return None
+
+        company = self._css_first(card, [
+            "h4.base-search-card__subtitle",
+            ".base-search-card__subtitle",
+            "a.hidden-nested-link",
+        ])
+        company_text = self.clean_text(self._get_text(company)) if company else "Unknown"
+
+        location = self._css_first(card, [
+            "span.job-search-card__location",
+            ".job-search-card__location",
+        ])
+        location_text = self.clean_text(self._get_text(location)) if location else self._default_location
+
+        posted = self._css_first(card, [
+            "time.job-search-card__listdate",
+            "time",
+        ])
+        posted_date = None
+        if posted is not None:
+            posted_date = posted.attrib.get("datetime") if hasattr(posted, "attrib") else None
+            if not posted_date:
+                posted_date = self.clean_text(self._get_text(posted))
+
+        job_data: JobData = {
+            "job_id": self.generate_job_id(title_text, company_text, location_text),
+            "title": title_text,
+            "company": company_text,
+            "location": location_text,
+            "job_url": job_url,
+            "board": self.board_name,
+            "description": "",
+            "skills": [],
+            "posted_date": posted_date,
+            "salary": None,
+            "employment_type": None,
+            "experience_required": None,
+            "raw_html": "",
+        }
+        if self.validate_job_data(job_data):
+            return job_data
+        return None
+
+    def parse_listing(self, response: Any) -> List[str]:
+        """Extract guest cards plus /jobs/view/ URLs from LinkedIn search results."""
+        self._listing_jobs = []
+        urls: List[str] = []
+        seen = set()
+
+        try:
+            cards = response.css("div.base-card") or []
+            if not cards:
+                cards = response.css("div.job-search-card") or []
+            if not cards:
+                cards = response.css("li.jobs-search-results__list-item") or []
+
+            for card in cards:
+                job = self._parse_card(card)
+                if not job or job["job_url"] in seen:
+                    continue
+                seen.add(job["job_url"])
+                self._listing_jobs.append(job)
+                urls.append(job["job_url"])
+
+            if not urls:
+                selectors = [
+                    "a.base-card__full-link",
+                    ".job-search-card__link-wrapper",
+                    ".jobs-search-results__list-item a",
+                ]
+                links = []
+                for selector in selectors:
+                    found = response.css(selector)
+                    if found:
+                        links.extend(found)
+                for link in links:
+                    href = link.attrib.get("href", "") if hasattr(link, "attrib") else ""
+                    job_url = self.guest_job_url(href)
+                    if not job_url or job_url in seen:
+                        continue
+                    title_text = self.clean_text(self._get_text(link)) or "Untitled"
+                    job = {
+                        "job_id": self.generate_job_id(title_text, "Unknown", self._default_location),
+                        "title": title_text,
+                        "company": "Unknown",
+                        "location": self._default_location,
+                        "job_url": job_url,
+                        "board": self.board_name,
+                        "description": "",
+                        "skills": [],
+                        "posted_date": None,
+                        "salary": None,
+                        "employment_type": None,
+                        "experience_required": None,
+                        "raw_html": "",
+                    }
+                    seen.add(job_url)
+                    self._listing_jobs.append(job)
+                    urls.append(job_url)
+
+            print(
+                f"LinkedIn: Found {len(urls)} job URLs "
+                f"({len(self._listing_jobs)} listing cards)"
+            )
+        except Exception as e:
+            print(f"LinkedIn listing parse error: {e}")
+
+        return urls
+    
+    def build_search_url(self, query: str, location: str = "Pakistan", page: int = 1) -> str:
+        """
+        Build LinkedIn job search URL.
+        
+        Args:
+            query: Search keywords
+            location: Location filter
+            page: Page number (LinkedIn uses start index)
+            
+        Returns:
+            Search URL
+        """
+        # LinkedIn uses start parameter (25 jobs per page)
+        start = (page - 1) * 25
+        
+        # URL encode query
+        import urllib.parse
+        query_encoded = urllib.parse.quote(query)
+        # "Remote" = remote jobs anywhere: LinkedIn's worldwide location plus its
+        # remote work-type filter (f_WT=2), rather than a place called "Remote".
+        remote = (location or "").strip().lower() == "remote"
+        location_encoded = urllib.parse.quote("Worldwide" if remote else location)
+        
+        url = (
+            f"https://www.linkedin.com/jobs/search/"
+            f"?keywords={query_encoded}"
+            f"&location={location_encoded}"
+            f"&start={start}"
+        )
+        if remote:
+            url += "&f_WT=2"
+        
+        return url
+
+
+def parse_linkedin_job(response: Any) -> Optional[JobData]:
+    """Convenience function for LinkedIn job parsing."""
+    parser = LinkedInParser()
+    return parser.parse_job(response)

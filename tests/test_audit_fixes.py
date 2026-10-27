@@ -1,0 +1,366 @@
+"""Regression tests for persistence, enrichment and date-parsing fixes."""
+
+import os
+import sys
+import unittest
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from services.posted_date import parse_posted_date
+
+try:
+    from main import _TotalsAccumulator, _persist_scraped_jobs, _process_single_role
+    from pipeline.enricher import JobEnricher
+    from services.supabase import SupabaseService
+except ImportError:  # pragma: no cover - runtime deps missing
+    _persist_scraped_jobs = None
+
+from tests.test_scrape_resilience import _settings
+
+NOW = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def _enricher():
+    enricher = JobEnricher.__new__(JobEnricher)
+    enricher.skill_list = ["C++", "C#", ".NET", "Python", "Node.js", "Java"]
+    return enricher
+
+
+class TestPostedDate(unittest.TestCase):
+    def test_board_prefixes(self):
+        self.assertEqual(parse_posted_date("Posted 2 days ago", now=NOW).day, 30)
+        self.assertEqual(parse_posted_date("Active 3 days ago", now=NOW).day, 29)
+        self.assertEqual(parse_posted_date("Posted 30+ days ago", now=NOW).month, 9)
+        self.assertEqual(parse_posted_date("Just posted", now=NOW), NOW)
+
+    def test_absolute_month_name(self):
+        self.assertEqual(parse_posted_date("Sep 30, 2026", now=NOW).date().isoformat(), "2026-09-30")
+
+
+@unittest.skipIf(_persist_scraped_jobs is None, "scraper runtime deps are required")
+class TestEnricher(unittest.TestCase):
+    def test_salary_k_applies_per_number_only(self):
+        salary = _enricher().normalize_salary("PKR 80,000 - 120,000", "Pakistan")
+        self.assertEqual((salary["min"], salary["max"]), (80000, 120000))
+
+    def test_salary_k_suffix(self):
+        salary = _enricher().normalize_salary("80k - 120k", "Pakistan")
+        self.assertEqual((salary["min"], salary["max"]), (80000, 120000))
+
+    def test_salary_week_period(self):
+        salary = _enricher().normalize_salary("$1500-2000 per week", "Remote")
+        self.assertEqual((salary["min"], salary["period"]), (1500, "week"))
+
+    def test_skills_with_symbols(self):
+        found = _enricher().extract_skills("C++ and C# and .NET, Node.js and Python", "SE")
+        flat = {s for group in found.values() for s in group}
+        self.assertTrue({"C++", "C#", ".NET", "Node.js", "Python"} <= flat)
+        self.assertNotIn("Java", flat)
+
+    def test_board_job_type_wins_over_prose(self):
+        self.assertEqual(
+            _enricher().extract_job_type("Contract type: Permanent", "full-time"), "Full-time"
+        )
+
+
+@unittest.skipIf(_persist_scraped_jobs is None, "scraper runtime deps are required")
+class TestPersistence(unittest.TestCase):
+    def _job(self, job_id="j1", desc="A full job description long enough to persist."):
+        return {"job_id": job_id, "title": "SE", "company": "Acme", "board": "indeed", "description": desc}
+
+    def test_unchanged_job_is_touched_not_rewritten(self):
+        supabase = Mock()
+        supabase.get_jobs_by_ids.return_value = {
+            "j1": {"job_id": "j1", "job_description": "A full job description long enough to persist.",
+                   "company": "Acme", "job_title": "SE", "location": "x", "url": "u", "job_type": "t",
+                   "salary_raw": "s", "posted_date": "p", "skills_required": ["x"]}
+        }
+        supabase.get_processed_ids.return_value = {"j1"}
+        affected = _persist_scraped_jobs([self._job()], supabase, _TotalsAccumulator(), 100, {})
+        self.assertEqual(affected, 0)
+        supabase.touch_jobs.assert_called_once_with(["j1"])
+        supabase.bulk_insert_jobs.assert_not_called()
+
+    def test_stored_but_unprocessed_job_is_merged_not_replaced(self):
+        supabase = Mock()
+        long_jd = "Stored full JD " * 20
+        supabase.get_jobs_by_ids.return_value = {"j1": {"job_id": "j1", "job_description": long_jd}}
+        supabase.get_processed_ids.return_value = set()
+        supabase.bulk_insert_jobs.side_effect = lambda batch: len(batch)
+        with patch("main.job_enricher_node", side_effect=lambda state: state):
+            _persist_scraped_jobs([self._job(desc="Short card text for the listing.")], supabase,
+                                  _TotalsAccumulator(), 100, {})
+        written = supabase.bulk_insert_jobs.call_args[0][0][0]
+        self.assertEqual(written["description"], long_jd)
+
+    def test_enrichment_error_raises_instead_of_writing(self):
+        supabase = Mock()
+        supabase.get_jobs_by_ids.return_value = {}
+        supabase.get_processed_ids.return_value = set()
+        with patch("main.job_enricher_node", return_value={"raw_job_list": [], "error": "boom"}):
+            with self.assertRaises(RuntimeError):
+                _persist_scraped_jobs([self._job()], supabase, _TotalsAccumulator(), 100, {})
+        supabase.bulk_insert_jobs.assert_not_called()
+
+    def test_failed_batch_is_requeued_and_retried(self):
+        supabase = Mock()
+        supabase.get_processed_ids.return_value = set()
+        supabase.get_jobs_by_ids.side_effect = [ConnectionError("blip"), {}, {}]
+        supabase.bulk_insert_jobs.side_effect = lambda batch: len(batch)
+        jobs = [self._job(f"j{i}", f"A full job description number {i} long enough.") for i in range(3)]
+
+        def fake_scrape(self, board, on_jobs=None, **_kwargs):
+            try:
+                on_jobs(jobs[:2])  # first flush fails; spider swallows callback errors
+            except ConnectionError:
+                pass
+            return jobs
+
+        totals = _TotalsAccumulator()
+        with patch("main.JobScraperSpider.scrape_board", fake_scrape), patch(
+            "main.job_enricher_node", side_effect=lambda state: state
+        ):
+            ok = _process_single_role("SE", 1, 1, _settings(job_scraping_boards=["indeed"]),
+                                      supabase, totals, batch_size=2)
+        self.assertTrue(ok)
+        written = [job["job_id"] for call in supabase.bulk_insert_jobs.call_args_list for job in call[0][0]]
+        self.assertEqual(sorted(written), ["j0", "j1", "j2"])
+
+    def test_role_fails_when_every_board_fails(self):
+        def boom(self, board, **_kwargs):
+            raise RuntimeError("blocked")
+
+        totals = _TotalsAccumulator()
+        with patch("main.JobScraperSpider.scrape_board", boom):
+            ok = _process_single_role("SE", 1, 1, _settings(job_scraping_boards=["indeed", "linkedin"]),
+                                      Mock(), totals)
+        self.assertFalse(ok)
+        self.assertEqual(totals.failed_roles, ["SE"])
+
+
+@unittest.skipIf(_persist_scraped_jobs is None, "scraper runtime deps are required")
+class TestBulkInsertDedup(unittest.TestCase):
+    def test_duplicate_ids_in_one_batch_keep_longest(self):
+        service = SupabaseService.__new__(SupabaseService)
+        service.client = Mock()
+        jobs = [
+            {"job_id": "j1", "title": "SE", "company": "A", "description": "short"},
+            {"job_id": "j1", "title": "SE", "company": "A", "description": "a much longer description"},
+        ]
+        self.assertEqual(service.bulk_insert_jobs(jobs), 1)
+        records = service.client.table.return_value.upsert.call_args[0][0]
+        self.assertEqual(len(records), 1)
+        self.assertIn("much longer", records[0]["job_description"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestStableJobId(unittest.TestCase):
+    def setUp(self):
+        from scraper.job_identity import stable_job_id
+        from scraper.listing_persist import prepare_job_for_persist
+        self.sid = stable_job_id
+        self.prepare = prepare_job_for_persist
+
+    def test_indeed_same_jk_same_id_regardless_of_card_fields(self):
+        card = {"board": "indeed", "job_url": "https://pk.indeed.com/viewjob?jk=abc123def4567890", "title": "SE", "company": "Unknown"}
+        detail = {"board": "indeed", "job_url": "https://pk.indeed.com/rc/clk?jk=ABC123DEF4567890&from=serp", "title": "SE", "company": "Acme"}
+        self.assertEqual(self.sid(card), self.sid(detail))
+
+    def test_same_title_company_location_different_postings_differ(self):
+        a = {"board": "linkedin", "job_url": "https://www.linkedin.com/jobs/view/software-engineer-at-acme-4012345678?refId=x"}
+        b = {"board": "linkedin", "job_url": "https://www.linkedin.com/jobs/view/4099999999/"}
+        self.assertNotEqual(self.sid(a), self.sid(b))
+        self.assertEqual(self.sid(a), self.sid({"board": "linkedin", "job_url": "https://linkedin.com/jobs/view/4012345678"}))
+
+    def test_board_is_part_of_the_key(self):
+        url = "https://www.rozee.pk/acme-software-engineer-lahore-jobs-1234567"
+        self.assertNotEqual(self.sid({"board": "rozee", "job_url": url}), self.sid({"board": "mustakbil", "job_url": url}))
+
+    def test_search_pages_and_missing_urls_fall_back(self):
+        self.assertIsNone(self.sid({"board": "rozee", "job_url": "https://www.rozee.pk/job/jsearch/q/python"}))
+        self.assertIsNone(self.sid({"board": "mustakbil", "job_url": "https://www.mustakbil.com/jobs/search?keywords=x"}))
+        self.assertIsNone(self.sid({"board": "indeed", "job_url": ""}))
+
+    def test_prepare_sets_native_id_and_keeps_old_hash_without_url(self):
+        job = {"job_id": "oldhash", "board": "indeed", "job_url": "https://pk.indeed.com/viewjob?jk=abc123def4567890",
+               "title": "SE", "company": "Acme", "description": "A full description long enough to persist here."}
+        self.assertEqual(self.prepare(job)["job_id"], self.sid(job))
+        no_url = {**job, "job_url": ""}
+        self.assertEqual(self.prepare(no_url)["job_id"], "oldhash")
+
+
+class TestCacheRefresh(unittest.TestCase):
+    def test_skipped_without_url(self):
+        from services.cache_refresh import refresh_jobs_cache
+        with patch.dict(os.environ, {"JOBS_CACHE_REFRESH_URL": "", "JOBS_CRON_SECRET": "s"}):
+            self.assertFalse(refresh_jobs_cache())
+
+    def test_posts_secret_header(self):
+        from services import cache_refresh
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+            def read(self, n): return b'{"ok":true}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(request, timeout):
+            seen["url"], seen["method"] = request.full_url, request.get_method()
+            seen["secret"] = request.get_header("X-cron-secret")
+            return FakeResponse()
+
+        env = {"JOBS_CACHE_REFRESH_URL": "https://api.example.com/api/v1/internal/jobs-cache/refresh", "JOBS_CRON_SECRET": "s3"}
+        with patch.dict(os.environ, env), patch.object(cache_refresh.urllib.request, "urlopen", fake_urlopen):
+            self.assertTrue(cache_refresh.refresh_jobs_cache())
+        self.assertEqual(seen, {"url": env["JOBS_CACHE_REFRESH_URL"], "method": "POST", "secret": "s3"})
+
+
+class TestLinkedInChrome(unittest.TestCase):
+    def setUp(self):
+        from scraper.boards.linkedin_jd import strip_linkedin_chrome
+        self.strip = strip_linkedin_chrome
+
+    def test_drops_toggle_and_criteria_tail(self):
+        raw = ("We build security tooling. You will own incident response. "
+               "Show more Show less Seniority level Mid-Senior level Employment type Contract "
+               "Job function Engineering Industries IT Services and IT Consulting.")
+        self.assertEqual(self.strip(raw), "We build security tooling. You will own incident response.")
+
+    def test_criteria_without_toggle_and_trailing_see_more(self):
+        self.assertEqual(self.strip("Great role. Seniority level Entry level Employment type Full-time"), "Great role.")
+        self.assertEqual(self.strip("Great role… See more"), "Great role…")
+
+    def test_body_mentioning_employment_type_is_kept(self):
+        body = "Employment type: full time, onsite in Lahore. We value ownership."
+        self.assertEqual(self.strip(body), body)
+
+    def test_clean_markup_beats_longer_container_with_chrome(self):
+        from scraper.boards.linkedin_jd import extract_description_multi
+        jd = "We are hiring a backend engineer to design APIs and own reliability across services."
+        html = (f'<section class="description"><div class="show-more-less-html__markup">{jd}</div>'
+                '<button>Show more</button><button>Show less</button>'
+                '<ul><li>Seniority level Entry level</li><li>Employment type Full-time</li></ul></section>')
+        text, _ = extract_description_multi(html, None)
+        self.assertEqual(text, jd)
+
+
+class TestIndeedBotWall(unittest.TestCase):
+    def setUp(self):
+        import scraper.spider as spider
+        self.spider = spider
+        spider._indeed_viewjob_blocks = 0
+
+    def tearDown(self):
+        self.spider._indeed_viewjob_blocks = 0
+
+    def test_detects_bot_redirect(self):
+        from types import SimpleNamespace
+        blocked = SimpleNamespace(url="https://secure.indeed.com/auth?continue=x&from=bot-detection-anonymous")
+        ok = SimpleNamespace(url="https://pk.indeed.com/viewjob?jk=abc")
+        self.assertTrue(self.spider.is_bot_detection(blocked))
+        self.assertFalse(self.spider.is_bot_detection(ok))
+
+    def test_viewjob_disabled_after_consecutive_blocks_and_reset_on_success(self):
+        for _ in range(self.spider.INDEED_VIEWJOB_BLOCK_LIMIT - 1):
+            self.spider._note_indeed_viewjob(blocked=True)
+        self.assertFalse(self.spider.indeed_viewjob_disabled())
+        self.spider._note_indeed_viewjob(blocked=False)
+        for _ in range(self.spider.INDEED_VIEWJOB_BLOCK_LIMIT):
+            self.spider._note_indeed_viewjob(blocked=True)
+        self.assertTrue(self.spider.indeed_viewjob_disabled())
+
+
+class TestDetailLoopMaxJobs(unittest.TestCase):
+    def test_every_card_gets_a_detail_fetch_when_cards_fill_max_jobs(self):
+        from types import SimpleNamespace
+        import scraper.spider as spider_mod
+        from scraper.boards.indeed import IndeedParser
+        from scraper.spider import JobScraperSpider
+
+        spider_mod._indeed_viewjob_blocks = 0
+        parser = IndeedParser()
+        cards = [
+            {"job_id": f"id{i}", "title": f"Engineer {i}", "company": "Acme", "location": "Lahore",
+             "job_url": f"https://pk.indeed.com/viewjob?jk={i}aaaaaaaaaaaaaaa", "board": "indeed",
+             "description": "snippet", "skills": []}
+            for i in range(3)
+        ]
+        listing = SimpleNamespace(url="https://pk.indeed.com/jobs", status=200, body="<html>jobs</html>")
+        wall = SimpleNamespace(url="https://secure.indeed.com/auth?from=bot-detection-anonymous", status=200, body="login")
+        detail_urls = []
+
+        def fake_fetch(url, *args, **kwargs):
+            if url == "https://pk.indeed.com/jobs":
+                return listing
+            detail_urls.append(url)
+            return wall
+
+        def fake_parse(_response):
+            parser._listing_jobs = [dict(c) for c in cards]
+            return [c["job_url"] for c in cards]
+
+        spider = JobScraperSpider()
+        spider.parsers["indeed"] = parser
+        spider.settings.job_scraping_download_delay = 0
+        with patch("scraper.spider._fetch_with_scrapling", side_effect=fake_fetch), \
+                patch.object(parser, "parse_listing", side_effect=fake_parse), \
+                patch.object(parser, "build_search_url", return_value="https://pk.indeed.com/jobs"):
+            spider.scrape_board("indeed", "Engineer", max_pages=1, max_jobs=3)
+        spider_mod._indeed_viewjob_blocks = 0
+
+        tried = {jk for jk in ("0aaa", "1aaa", "2aaa") if any(jk in u for u in detail_urls)}
+        self.assertEqual(tried, {"0aaa", "1aaa", "2aaa"})
+
+
+class TestIndeedFetchOptions(unittest.TestCase):
+    def _kwargs(self, url, board="indeed"):
+        import scraper.fetch_worker as fw
+        captured = {}
+
+        class FakeFetcher:
+            @staticmethod
+            def fetch(u, **kwargs):
+                captured.update(kwargs)
+                return "ok"
+
+        with patch.dict(sys.modules, {"scrapling": type(sys)("scrapling")}):
+            sys.modules["scrapling"].StealthyFetcher = FakeFetcher
+            fw._stealthy_fetch(url, board, True, 0, True)
+        return captured
+
+    def test_indeed_pane_skips_network_idle_and_selector_wait(self):
+        kw = self._kwargs("https://pk.indeed.com/jobs?q=x&l=Pakistan&vjk=abc")
+        self.assertFalse(kw["network_idle"])
+        self.assertNotIn("wait_selector", kw)
+        self.assertTrue(kw["disable_resources"])
+
+    def test_indeed_listing_waits_for_cards(self):
+        kw = self._kwargs("https://pk.indeed.com/jobs?q=x&l=Pakistan&start=10")
+        self.assertIn("job_seen_beacon", kw["wait_selector"])
+
+    def test_linkedin_detail_waits_for_jd_not_network_idle(self):
+        import scraper.fetch_worker as fw
+        captured = {}
+
+        class FakeFetcher:
+            @staticmethod
+            def fetch(u, **kwargs):
+                captured.update(kwargs)
+                return "ok"
+
+        with patch.dict(sys.modules, {"scrapling": type(sys)("scrapling")}):
+            sys.modules["scrapling"].StealthyFetcher = FakeFetcher
+            fw._stealthy_fetch("https://pk.linkedin.com/jobs/view/x-1", "linkedin", True, 0, True, job_detail=True)
+        self.assertFalse(captured["network_idle"])
+        self.assertIn("show-more-less-html__markup", captured["wait_selector"])
+
+    def test_other_boards_unchanged(self):
+        kw = self._kwargs("https://www.rozee.pk/job/jsearch/q/x", board="rozee")
+        self.assertTrue(kw["network_idle"])
+        self.assertNotIn("wait_selector", kw)

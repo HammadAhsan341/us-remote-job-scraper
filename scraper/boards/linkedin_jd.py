@@ -1,0 +1,152 @@
+"""LinkedIn job-description extraction (collapsed "See more" + JSON-LD)."""
+
+from __future__ import annotations
+
+import html as html_lib
+import re
+from typing import Any, List, Tuple
+
+from scraper.guest import jsonld_job_descriptions
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+_MARKUP_BLOCK_RE = re.compile(
+    r'<div[^>]*class="[^"]*show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>',
+    re.IGNORECASE | re.DOTALL,
+)
+_EMBEDDED_JSON_DESC_RE = re.compile(
+    r'"(?:description|jobDescription|job_description)"\s*:\s*"((?:\\.|[^"\\])*)"',
+    re.IGNORECASE,
+)
+_ARTICLE_BODY_RE = re.compile(
+    r'"articleBody"\s*:\s*"((?:\\.|[^"\\])*)"',
+    re.IGNORECASE,
+)
+
+
+# The outer description containers also hold the collapse button labels and the
+# job-criteria list ("Seniority level ... Employment type ... Industries").
+# Taking the longest candidate made those containers win, so every stored
+# LinkedIn JD ended with that UI text.
+_SHOW_MORE_LESS_RE = re.compile(r"\s*\bshow more\s+show less\b", re.IGNORECASE)
+_CRITERIA_TAIL_RE = re.compile(
+    r"\s*\bSeniority level\b.{0,200}?\bEmployment type\b.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TRAILING_TOGGLE_RE = re.compile(r"(?:\s*\b(?:show|see) (?:more|less)\b[.…]*)+\s*$", re.IGNORECASE)
+
+
+def strip_linkedin_chrome(text: str) -> str:
+    """Drop the collapse-button labels and criteria list LinkedIn appends to a JD."""
+    if not text:
+        return ""
+    match = _SHOW_MORE_LESS_RE.search(text)
+    if match:
+        text = text[: match.start()]
+    text = _CRITERIA_TAIL_RE.sub("", text)
+    text = _TRAILING_TOGGLE_RE.sub("", text)
+    return text.strip()
+
+
+def _clean_html_text(raw: str) -> str:
+    if not raw:
+        return ""
+    text = _TAG_RE.sub(" ", html_lib.unescape(raw))
+    return _WS_RE.sub(" ", text).strip()
+
+
+def _text_from_nodes(response: Any, selector: str) -> List[str]:
+    if response is None:
+        return []
+    try:
+        nodes = response.css(selector)
+    except Exception:
+        return []
+    if not nodes:
+        return []
+    out: List[str] = []
+    for node in nodes:
+        try:
+            parts = node.css("::text").getall()
+            text = " ".join(parts) if parts else ""
+        except Exception:
+            text = str(getattr(node, "text", "") or "")
+        cleaned = _WS_RE.sub(" ", text).strip()
+        if len(cleaned) >= 20:
+            out.append(cleaned)
+    return out
+
+
+def embedded_json_descriptions(html: str) -> List[str]:
+    """LinkedIn SPA bootstraps often embed escaped JD strings in inline JSON."""
+    if not html:
+        return []
+    out: List[str] = []
+    for pattern in (_EMBEDDED_JSON_DESC_RE, _ARTICLE_BODY_RE):
+        for match in pattern.finditer(html):
+            raw = match.group(1) or ""
+            try:
+                decoded = bytes(raw, "utf-8").decode("unicode_escape")
+            except (UnicodeDecodeError, ValueError):
+                decoded = raw.replace("\\n", "\n").replace('\\"', '"')
+            text = _clean_html_text(decoded)
+            if len(text) >= 50:
+                out.append(text)
+    return out
+
+
+def markup_descriptions_from_html(html: str) -> List[str]:
+    """Full JD blocks LinkedIn keeps in show-more-less markup (often hidden until click)."""
+    if not html:
+        return []
+    out: List[str] = []
+    for match in _MARKUP_BLOCK_RE.finditer(html):
+        text = _clean_html_text(match.group(1) or "")
+        if len(text) >= 50:
+            out.append(text)
+    return out
+
+
+def extract_description_multi(html: str, response: Any) -> Tuple[str, str]:
+    """
+    Pick the longest plausible JD from DOM + raw HTML + JSON-LD.
+
+    Guest pages often show a short preview in description__text while the full
+    body lives in div.show-more-less-html__markup (visible only after "See more").
+    """
+    candidates: List[tuple[str, str]] = []
+
+    for text in _text_from_nodes(response, "div.show-more-less-html__markup"):
+        candidates.append(("markup_css", text))
+    for text in _text_from_nodes(response, "div[class*='show-more-less-html__markup']"):
+        candidates.append(("markup_css", text))
+
+    for text in _text_from_nodes(
+        response,
+        "div.description__text, .jobs-description-content__text, .jobs-description__content, section.description",
+    ):
+        candidates.append(("description_container", text))
+
+    for text in markup_descriptions_from_html(html):
+        candidates.append(("markup_html", text))
+
+    for text in embedded_json_descriptions(html):
+        candidates.append(("embedded_json", text))
+
+    for text in _text_from_nodes(
+        response,
+        "div.jobs-box__html-content, div.jobs-description__content, "
+        "article.jobs-description__container",
+    ):
+        candidates.append(("jobs_box", text))
+
+    for text in jsonld_job_descriptions(html):
+        candidates.append(("jsonld", text))
+
+    candidates = [(source, strip_linkedin_chrome(text)) for source, text in candidates]
+    candidates = [(source, text) for source, text in candidates if text]
+    if not candidates:
+        return "", ""
+
+    best_source, best = max(candidates, key=lambda item: len(item[1]))
+    return best, best_source
