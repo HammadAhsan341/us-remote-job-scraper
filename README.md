@@ -47,6 +47,28 @@ Apply `supabase/migrations/001_full_job_payload.sql` and `002_us_remote_market.s
 
 ---
 
+## Scheduled runs (GitHub Actions)
+
+**Workflow:** [US Remote Job Scrape](https://github.com/HammadAhsan341/us-remote-job-scraper/actions/workflows/scrape.yml)
+
+| Trigger | Schedule |
+| :------ | :------- |
+| Cron (UTC) | `:13`, `:33`, `:53` every hour |
+| Cron (PKT, UTC+5) | `:18`, `:38`, `:58` every hour |
+
+Each UTC hour runs **one shard** (see `scripts/schedule_slot.py`):
+
+| Slot (epoch hour mod 4) | Boards | Roles |
+| :---------------------- | :----- | :---- |
+| 0 | API/RSS feeds | Set 1 |
+| 1 | API/RSS feeds | Set 2 |
+| 2 | Browser job sites | Set 1 |
+| 3 | Indeed + LinkedIn (US remote) | Set 2 |
+
+Secrets must be set on the repo — see **[docs/GITHUB_ACTIONS.md](docs/GITHUB_ACTIONS.md)**.
+
+---
+
 ## Related repos
 
 | Repo                                                                   | Region   |

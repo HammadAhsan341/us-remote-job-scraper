@@ -2,11 +2,9 @@ name: US Remote Job Scrape
 
 on:
   schedule:
-    # GitHub often drops a run scheduled at minute 0 and does not retry it.
-    # Three off-peak attempts per hour; the gate skips one when this UTC
-    # hour already scraped successfully. Every attempt scrapes all five
-    # platforms for one country and one role set. The epoch-hour slot covers
-    # all 6 countries × 2 role sets every 12 hours.
+    # Three attempts per UTC hour (:13, :33, :53). schedule_gate.py skips if
+    # this hour already succeeded. schedule_slot.py picks board group + role set
+    # (feeds → browser → Indeed/LinkedIn over a 4-hour cycle).
     - cron: "13,33,53 * * * *"
   workflow_dispatch:
     inputs:

@@ -30,7 +30,18 @@ The scraper **does not run** until this repo has the same Action secrets as `job
 - **Country:** `US`
 - **Role set:** `all` or `1` / `2`
 
-Scheduled runs use cron `13,33,53 * * * *` (UTC).
+## Schedule (automatic)
+
+| UTC | PKT (UTC+5) | Behavior |
+| :-- | :---------- | :------- |
+| `:13` | `:18` | First attempt this hour |
+| `:33` | `:38` | Retry if the hour has not succeeded yet |
+| `:53` | `:58` | Last attempt before the next hour |
+
+Board group and role set come from `scripts/schedule_slot.py` (4-hour rotation).  
+The gate in `scripts/schedule_gate.py` skips duplicate work after a successful run in the same UTC hour.
+
+Ensure **Settings → Actions → General → Workflow permissions** allow read access and that Actions are enabled for the repository.
 
 ## Copy secrets from another repo
 
