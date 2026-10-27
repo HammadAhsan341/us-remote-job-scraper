@@ -1,8 +1,9 @@
 """Resolve the US remote scrape shard for scheduled GitHub Actions runs.
 
-Four hourly slots rotate board groups and role sets so each pass stays inside
-the ~22-minute run budget. A full cycle covers every board and both role sets
-within four UTC hours; the schedule gate avoids duplicate work in the same hour.
+Scheduled runs fire once per UTC hour (see schedule_gate.py). Every hour
+scrapes all RSS/API feed boards with an alternating role set. Browser boards
+run every 2 hours; Indeed/LinkedIn every 4 hours — so feed jobs refresh hourly
+instead of waiting for a 4-hour slot rotation.
 """
 
 from __future__ import annotations
@@ -22,13 +23,8 @@ BROWSER_BOARDS = (
 )
 AGGREGATOR_BOARDS = "indeed,linkedin"
 
-SLOTS: tuple[tuple[str, int], ...] = (
-    (FEED_BOARDS, 1),
-    (FEED_BOARDS, 2),
-    (BROWSER_BOARDS, 1),
-    (AGGREGATOR_BOARDS, 2),
-)
-SLOT_COUNT = len(SLOTS)
+# Kept for tests/docs: legacy 4-slot names (feeds were split across two hours).
+LEGACY_SLOT_COUNT = 4
 
 
 @dataclass(frozen=True)
@@ -39,12 +35,31 @@ class ScheduleSlot:
     role_set: int
 
 
+def _dedupe_boards_csv(*groups: str) -> str:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for group in groups:
+        for raw in group.split(","):
+            name = raw.strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+    return ",".join(ordered)
+
+
 def resolve_slot(epoch_hour: int) -> ScheduleSlot:
-    index = int(epoch_hour) % SLOT_COUNT
-    boards, role_set = SLOTS[index]
+    hour = int(epoch_hour)
+    role_set = (hour % 2) + 1
+    groups = [FEED_BOARDS]
+    if hour % 2 == 0:
+        groups.append(BROWSER_BOARDS)
+    if hour % 4 == 0:
+        groups.append(AGGREGATOR_BOARDS)
+    board = _dedupe_boards_csv(*groups)
     return ScheduleSlot(
-        index=index,
-        board=boards,
+        index=hour % LEGACY_SLOT_COUNT,
+        board=board,
         country="US",
         role_set=role_set,
     )
@@ -70,12 +85,10 @@ def main() -> None:
             handle.write("\n".join(lines) + "\n")
     else:
         print("\n".join(lines))
+    preview = slot.board if len(slot.board) <= 72 else f"{slot.board[:72]}..."
     print(
-        f"US remote slot {slot.index}/{SLOT_COUNT - 1} -> "
-        f"boards ({slot.board[:48]}...), {slot.country}, role set {slot.role_set}"
-        if len(slot.board) > 48
-        else f"US remote slot {slot.index}/{SLOT_COUNT - 1} -> "
-        f"boards {slot.board}, {slot.country}, role set {slot.role_set}"
+        f"US remote hour {epoch_hour}: role set {slot.role_set}, "
+        f"boards ({len(slot.board.split(','))}): {preview}"
     )
 
 

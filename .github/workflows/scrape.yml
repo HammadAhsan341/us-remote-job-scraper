@@ -3,8 +3,8 @@ name: US Remote Job Scrape
 on:
   schedule:
     # Three attempts per UTC hour (:13, :33, :53). schedule_gate.py skips if
-    # this hour already succeeded. schedule_slot.py picks board group + role set
-    # (feeds → browser → Indeed/LinkedIn over a 4-hour cycle).
+    # this hour already succeeded. schedule_slot.py runs all feed boards every
+    # hour; browser every 2h; Indeed/LinkedIn every 4h.
     - cron: "13,33,53 * * * *"
   workflow_dispatch:
     inputs:
