@@ -13,16 +13,17 @@ on:
       boards:
         description: "Boards to scrape"
         required: false
-        default: "remoteok,remotive,weworkremotely,indeed,linkedin"
+        default: "all"
         type: choice
         options:
-          - remoteok,remotive,weworkremotely,indeed,linkedin
+          - all
+          - remoteok,remotive,weworkremotely,himalayas,workingnomads,jobicy,jobspresso,arbeitnow
           - remoteok
           - remotive
           - weworkremotely
+          - himalayas
           - indeed
           - linkedin
-          - all
       country:
         description: "Country (US only for now)"
         required: false

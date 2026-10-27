@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.settings import _parse_boards
+from core.settings import DEFAULT_BOARDS, _parse_boards
 from scraper.spider import (
     _fetch_with_scrapling,
     is_board_cooling_down,
@@ -39,10 +39,10 @@ def _settings(**overrides):
         job_scraping_download_delay=0.0,
         job_scraping_max_pages_per_board=1,
         job_scraping_max_jobs_per_board=5,
-        job_scraping_boards=["bayt", "indeed"],
-        job_scraping_countries=["AE"],
+        job_scraping_boards=["remoteok", "indeed"],
+        job_scraping_countries=["US"],
         job_scraping_include_cities=False,
-        job_scraping_market="gulf",
+        job_scraping_market="us_remote",
         remote_roles=[],
     )
     values.update(overrides)
@@ -50,11 +50,9 @@ def _settings(**overrides):
 
 
 class TestBoardOrder(unittest.TestCase):
-    def test_all_puts_local_boards_first(self):
-        self.assertEqual(
-            _parse_boards("all"),
-            ["bayt", "gulftalent", "naukrigulf", "indeed", "linkedin"],
-        )
+    def test_all_puts_feed_boards_first(self):
+        self.assertEqual(_parse_boards("all"), DEFAULT_BOARDS)
+        self.assertEqual(_parse_boards("all")[0], "remoteok")
 
 
 class TestFetchTimeoutRetry(unittest.TestCase):
@@ -134,7 +132,7 @@ class TestFetchTimeoutRetry(unittest.TestCase):
 @unittest.skipIf(_process_single_role is None, "scraper runtime deps are required")
 class TestPerBoardPersist(unittest.TestCase):
     def test_upserts_after_each_board(self):
-        settings = _settings()
+        settings = _settings(job_scraping_boards=["remoteok", "indeed"])
         totals = _TotalsAccumulator()
         supabase = Mock()
         supabase.get_processed_ids.return_value = set()
@@ -142,7 +140,11 @@ class TestPerBoardPersist(unittest.TestCase):
         supabase.bulk_insert_jobs.return_value = 1
 
         jobs_by_board = {
-            "bayt": [{"job_id": "b1", "board": "bayt", "description": "Bayt listing text from the card."}],
+            "remoteok": [{
+                "job_id": "r1",
+                "board": "remoteok",
+                "description": "Remote OK API job description with enough text for persist.",
+            }],
             "indeed": [{
                 "job_id": "i1",
                 "board": "indeed",

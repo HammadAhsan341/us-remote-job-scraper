@@ -1,48 +1,40 @@
 import unittest
 
+from core.settings import DEFAULT_BOARDS
 from main import _role_searches
 from scraper.boards.linkedin import LinkedInParser
 from tests.test_scrape_resilience import _settings
 
-ALL_BOARDS = ["bayt", "gulftalent", "naukrigulf", "indeed", "linkedin"]
-UAE = "United Arab Emirates"
+US_REMOTE = "Remote, United States"
 
 
 class TestRemoteRoleSearches(unittest.TestCase):
-    def test_remote_role_gets_country_then_remote_on_linkedin_and_indeed(self):
-        settings = _settings(job_scraping_boards=ALL_BOARDS, remote_roles=["Graphic Designer"])
+    def test_each_active_board_gets_one_remote_us_pass(self):
+        settings = _settings(job_scraping_boards=["remoteok", "indeed", "linkedin"])
         self.assertEqual(
-            _role_searches("graphic designer", settings),
-            [(b, UAE) for b in ALL_BOARDS]
-            + [("indeed", "Remote, United Arab Emirates"), ("linkedin", "Remote")],
+            _role_searches("Software Engineer", settings),
+            [
+                ("remoteok", US_REMOTE),
+                ("indeed", US_REMOTE),
+                ("linkedin", US_REMOTE),
+            ],
         )
 
-    def test_other_roles_only_search_the_configured_country(self):
-        settings = _settings(job_scraping_boards=ALL_BOARDS, remote_roles=["Graphic Designer"])
-        self.assertEqual(_role_searches("Software Engineer", settings), [(b, UAE) for b in ALL_BOARDS])
+    def test_disabled_gulf_boards_are_not_in_default_all(self):
+        from core.settings import _parse_boards
 
-    def test_remote_pass_skips_boards_that_are_not_remote_capable(self):
-        settings = _settings(job_scraping_boards=["bayt"], remote_roles=["Graphic Designer"])
-        self.assertEqual(_role_searches("Graphic Designer", settings), [("bayt", UAE)])
-
-    def test_rozee_and_mustakbil_are_not_searched(self):
-        settings = _settings(
-            job_scraping_boards=["rozee", "mustakbil", "bayt"],
-            remote_roles=[],
-        )
-        self.assertEqual(_role_searches("Software Engineer", settings), [("bayt", UAE)])
+        parsed = _parse_boards("all")
+        self.assertEqual(parsed, DEFAULT_BOARDS)
+        self.assertNotIn("bayt", parsed)
 
 
 class TestLinkedInRemoteUrl(unittest.TestCase):
-    def test_remote_uses_worldwide_and_remote_filter(self):
-        url = LinkedInParser().build_search_url("Graphic Designer", "Remote", 1)
-        self.assertIn("location=Worldwide", url)
-        self.assertIn("f_WT=2", url)
-
-    def test_pakistan_search_is_unchanged(self):
-        url = LinkedInParser().build_search_url("Graphic Designer", "Pakistan", 1)
-        self.assertIn("location=Pakistan", url)
-        self.assertNotIn("f_WT", url)
+    def test_remote_us_search_uses_remote_location(self):
+        url = LinkedInParser().build_search_url(
+            "Software Engineer", "Remote, United States", 1
+        )
+        self.assertIn("keywords=Software", url.replace("+", " "))
+        self.assertIn("United", url)
 
 
 if __name__ == "__main__":
