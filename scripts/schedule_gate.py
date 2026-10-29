@@ -1,10 +1,4 @@
-"""Decide whether a scheduled scrape should start.
-
-GitHub drops cron events, especially at minute 0, and does not retry them.
-The workflow registers three attempts per hour. This gate keeps the extra
-attempts from scraping again after one success in the same UTC hour. A failed
-hour is retried by the next attempt. If the check itself fails, scrape anyway.
-"""
+"""Half-hour gate for US remote scheduled scrapes."""
 
 from __future__ import annotations
 
@@ -14,25 +8,29 @@ import sys
 import urllib.request
 from datetime import datetime, timezone
 
-ACTIVE = {"queued", "in_progress", "waiting", "pending", "requested"}
+HALF_HOUR_SECONDS = 1800
+
+
+def half_hour_bucket(dt: datetime) -> str:
+    utc = dt.astimezone(timezone.utc)
+    minute = 0 if utc.minute < 30 else 30
+    floored = utc.replace(minute=minute, second=0, microsecond=0)
+    return floored.strftime("%Y-%m-%dT%H:%M")
 
 
 def should_scrape(runs: list[dict], now: datetime, run_id: str) -> tuple[bool, str]:
-    hour = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
+    bucket = half_hour_bucket(now)
     for run in runs:
         if str(run.get("id")) == str(run_id):
             continue
-        status = run.get("status") or ""
-        if status in ACTIVE:
-            return False, f"run {run.get('id')} is {status}"
         if run.get("conclusion") != "success":
             continue
         started = _parse(run.get("run_started_at") or run.get("created_at") or "")
         if started is None:
             continue
-        if started.astimezone(timezone.utc).strftime("%Y-%m-%dT%H") == hour:
-            return False, f"successful run {run.get('id')} already started this UTC hour"
-    return True, "no successful scrape this UTC hour"
+        if half_hour_bucket(started) == bucket:
+            return False, f"successful run {run.get('id')} already started this 30-minute window"
+    return True, "no successful scrape this 30-minute window"
 
 
 def _parse(value: str) -> datetime | None:
@@ -47,7 +45,7 @@ def _parse(value: str) -> datetime | None:
 def fetch_runs(repo: str, token: str, workflow: str = "scrape.yml") -> list[dict]:
     url = (
         f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/runs"
-        "?per_page=20&event=schedule"
+        "?per_page=40&event=schedule"
     )
     request = urllib.request.Request(
         url,
