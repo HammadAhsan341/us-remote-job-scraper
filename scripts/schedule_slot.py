@@ -8,7 +8,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.schedule_gate import HALF_HOUR_SECONDS
+try:
+    from scripts.schedule_gate import HALF_HOUR_SECONDS
+except ModuleNotFoundError:
+    # `python scripts/schedule_slot.py` puts scripts/ on sys.path, not the repo root.
+    from schedule_gate import HALF_HOUR_SECONDS
 
 FEEDS_A = "remoteok,remotive,weworkremotely,himalayas"
 FEEDS_B = "workingnomads,jobicy,jobspresso,arbeitnow"
